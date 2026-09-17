@@ -29,5 +29,10 @@ export const api = {
     request(`/batches/${encodeURIComponent(barcode)}/events`, {
       method: 'POST',
       body: JSON.stringify(body)
+    }),
+  undoEvent: (barcode, id, body) =>
+    request(`/batches/${encodeURIComponent(barcode)}/events/${id}/undo`, {
+      method: 'POST',
+      body: JSON.stringify(body)
     })
 }

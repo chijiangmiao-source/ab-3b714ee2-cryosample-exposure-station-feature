@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 	api.GET("/batches/:barcode", s.getBatch)
 	api.GET("/batches/:barcode/events", s.listEvents)
 	api.POST("/batches/:barcode/events", s.createEvent)
+	api.POST("/batches/:barcode/events/:id/undo", s.undoEvent)
 	return r
 }
 
@@ -181,7 +183,51 @@ func (s *Server) createEvent(c *gin.Context) {
 	s.respondBatch(c, http.StatusCreated, b)
 }
 
-// respondBatch renders the batch together with its latest event (if any).
+type undoEventReq struct {
+	At     string `json:"at"`
+	Reason string `json:"reason"`
+}
+
+func (s *Server) undoEvent(c *gin.Context) {
+	barcode := c.Param("barcode")
+	eventID, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeErr(c, http.StatusBadRequest, "invalid_event_id", "event id must be an integer")
+		return
+	}
+	var req undoEventReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeErr(c, http.StatusBadRequest, "bad_request", "invalid JSON body: "+err.Error())
+		return
+	}
+	at, err := parseEventTime(req.At)
+	if err != nil {
+		writeErr(c, http.StatusBadRequest, "invalid_time", err.Error())
+		return
+	}
+	req.Reason = strings.TrimSpace(req.Reason)
+	if req.Reason == "" {
+		writeErr(c, http.StatusBadRequest, "reason_required", "a non-empty reason is required to undo an event")
+		return
+	}
+	b, err := s.st.UndoEvent(c.Request.Context(), barcode, eventID, at, req.Reason)
+	if errors.Is(err, store.ErrNotFound) {
+		writeErr(c, http.StatusNotFound, "not_found", "no batch or event with this id")
+		return
+	}
+	var ce *store.ConflictError
+	if errors.As(err, &ce) {
+		writeErr(c, http.StatusConflict, ce.Code, ce.Message)
+		return
+	}
+	if err != nil {
+		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.respondBatch(c, http.StatusOK, b)
+}
+
+// respondBatch renders the batch together with its latest active event (if any).
 func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch) {
 	var last *eventJSON
 	if ev, err := s.st.LastEvent(c.Request.Context(), b.Barcode); err == nil && ev != nil {
@@ -202,19 +248,27 @@ func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch) {
 }
 
 type eventJSON struct {
-	ID           int64  `json:"id"`
-	Type         string `json:"type"`
-	At           string `json:"at"`
-	DeltaSeconds *int64 `json:"deltaSeconds"`
+	ID           int64   `json:"id"`
+	Type         string  `json:"type"`
+	At           string  `json:"at"`
+	DeltaSeconds *int64  `json:"deltaSeconds"`
+	UndoneAt     *string `json:"undoneAt"`   // null while the event is active
+	UndoReason   *string `json:"undoReason"` // null while the event is active
 }
 
 func toEventJSON(ev *store.Event) eventJSON {
-	return eventJSON{
+	out := eventJSON{
 		ID:           ev.ID,
 		Type:         ev.Type,
 		At:           ev.At.UTC().Format(time.RFC3339),
 		DeltaSeconds: ev.DeltaSeconds,
+		UndoReason:   ev.UndoReason,
 	}
+	if ev.UndoneAt != nil {
+		u := ev.UndoneAt.UTC().Format(time.RFC3339)
+		out.UndoneAt = &u
+	}
+	return out
 }
 
 type batchJSON struct {

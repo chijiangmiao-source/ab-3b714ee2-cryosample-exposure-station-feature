@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -31,10 +32,12 @@ type batchResp struct {
 	RemainingSeconds   int64  `json:"remainingSeconds"`
 	CreatedAt          string `json:"createdAt"`
 	LastEvent          *struct {
-		ID           int64  `json:"id"`
-		Type         string `json:"type"`
-		At           string `json:"at"`
-		DeltaSeconds *int64 `json:"deltaSeconds"`
+		ID           int64   `json:"id"`
+		Type         string  `json:"type"`
+		At           string  `json:"at"`
+		DeltaSeconds *int64  `json:"deltaSeconds"`
+		UndoneAt     *string `json:"undoneAt"`
+		UndoReason   *string `json:"undoReason"`
 	} `json:"lastEvent"`
 }
 
@@ -45,13 +48,17 @@ type errResp struct {
 	} `json:"error"`
 }
 
+type eventResp struct {
+	ID           int64   `json:"id"`
+	Type         string  `json:"type"`
+	At           string  `json:"at"`
+	DeltaSeconds *int64  `json:"deltaSeconds"`
+	UndoneAt     *string `json:"undoneAt"`
+	UndoReason   *string `json:"undoReason"`
+}
+
 type eventsResp struct {
-	Events []struct {
-		ID           int64  `json:"id"`
-		Type         string `json:"type"`
-		At           string `json:"at"`
-		DeltaSeconds *int64 `json:"deltaSeconds"`
-	} `json:"events"`
+	Events []eventResp `json:"events"`
 }
 
 func newServer(t *testing.T) *httptest.Server {
@@ -129,6 +136,21 @@ func listEvents(t *testing.T, srv *httptest.Server, barcode string) eventsResp {
 	var ev eventsResp
 	require.NoError(t, json.Unmarshal(raw, &ev))
 	return ev
+}
+
+func undoEvent(t *testing.T, srv *httptest.Server, barcode string, id int64, at, reason string) (int, batchResp, errResp) {
+	t.Helper()
+	code, raw := doJSON(t, http.MethodPost,
+		srv.URL+"/api/batches/"+barcode+"/events/"+strconv.FormatInt(id, 10)+"/undo",
+		map[string]string{"at": at, "reason": reason})
+	var b batchResp
+	var e errResp
+	if code == http.StatusOK {
+		require.NoError(t, json.Unmarshal(raw, &b))
+	} else {
+		require.NoError(t, json.Unmarshal(raw, &e))
+	}
+	return code, b, e
 }
 
 // --- creation & validation ---------------------------------------------------
@@ -548,4 +570,324 @@ func TestEventOnUnknownBatch(t *testing.T) {
 	code, _, e := postEvent(t, srv, "GHOST", "takeout", "2026-09-13T08:00:10Z")
 	assert.Equal(t, http.StatusNotFound, code)
 	assert.Equal(t, "not_found", e.Error.Code)
+}
+
+// --- undo of mis-scanned events ----------------------------------------------
+
+// Main acceptance flow: a mis-scanned return pushes the batch over the limit
+// and scraps it; undoing the return restores the out-of-cabinet state with
+// the original accumulated total, and the batch can be returned correctly.
+func TestUndoReturnAfterScrapRestoresOutAndUsable(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-1", 10, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-1", "takeout", "2026-09-13T08:00:05Z")
+	code, b, _ := postEvent(t, srv, "U-1", "return", "2026-09-13T08:00:16Z") // +11 > 10
+	require.Equal(t, http.StatusCreated, code)
+	require.Equal(t, "scrapped", b.Status)
+
+	events := listEvents(t, srv, "U-1").Events
+	require.Len(t, events, 2)
+	returnID := events[1].ID
+
+	code, b, _ = undoEvent(t, srv, "U-1", returnID, "2026-09-13T08:00:20Z", "误扫归还")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "out", b.State, "undoing a return restores the out-of-cabinet state")
+	assert.Equal(t, int64(0), b.AccumulatedSeconds, "the mistaken exposure is subtracted back")
+	assert.Equal(t, "usable", b.Status, "usability is re-judged from the restored total")
+	assert.True(t, b.Usable)
+	require.NotNil(t, b.LastEvent)
+	assert.Equal(t, "takeout", b.LastEvent.Type, "last event falls back to the still-active takeout")
+	assert.Equal(t, "2026-09-13T08:00:05Z", b.LastEvent.At)
+
+	// The undone event keeps its audit trail; the takeout stays active.
+	events = listEvents(t, srv, "U-1").Events
+	require.Len(t, events, 2)
+	assert.Nil(t, events[0].UndoneAt)
+	require.NotNil(t, events[1].UndoneAt)
+	assert.Equal(t, "2026-09-13T08:00:20Z", *events[1].UndoneAt)
+	require.NotNil(t, events[1].UndoReason)
+	assert.Equal(t, "误扫归还", *events[1].UndoReason)
+	require.NotNil(t, events[1].DeltaSeconds, "the original exposure record is kept")
+
+	// The batch can be returned again with the correct time.
+	code, b, _ = postEvent(t, srv, "U-1", "return", "2026-09-13T08:00:14Z")
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(9), b.AccumulatedSeconds)
+	assert.Equal(t, "usable", b.Status)
+}
+
+func TestUndoTakeoutRestoresInCabinet(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-2", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-2", "takeout", "2026-09-13T08:00:10Z")
+
+	events := listEvents(t, srv, "U-2").Events
+	require.Len(t, events, 1)
+
+	code, b, _ := undoEvent(t, srv, "U-2", events[0].ID, "2026-09-13T08:00:20Z", "误扫取出")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "in", b.State, "undoing a takeout puts the batch back into the cabinet")
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+	assert.Equal(t, "usable", b.Status)
+	assert.Nil(t, b.LastEvent, "no active event remains")
+
+	events = listEvents(t, srv, "U-2").Events
+	require.Len(t, events, 1, "the undone event stays in the audit trail")
+	require.NotNil(t, events[0].UndoneAt)
+	assert.Equal(t, "2026-09-13T08:00:20Z", *events[0].UndoneAt)
+
+	// Operation continues from the restored state.
+	code, b, _ = postEvent(t, srv, "U-2", "takeout", "2026-09-13T08:00:30Z")
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, "out", b.State)
+}
+
+func TestUndoChainBackwardsOneByOne(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-3", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-3", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "U-3", "return", "2026-09-13T08:00:20Z") // +10
+	postEvent(t, srv, "U-3", "takeout", "2026-09-13T08:00:30Z")
+
+	events := listEvents(t, srv, "U-3").Events
+	require.Len(t, events, 3)
+
+	// Only the last active event can be undone, one at a time.
+	code, b, _ := undoEvent(t, srv, "U-3", events[2].ID, "2026-09-13T08:00:40Z", "误扫取出")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(10), b.AccumulatedSeconds)
+
+	code, b, _ = undoEvent(t, srv, "U-3", events[1].ID, "2026-09-13T08:00:41Z", "误扫归还")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "out", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+
+	code, b, _ = undoEvent(t, srv, "U-3", events[0].ID, "2026-09-13T08:00:42Z", "误扫取出")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "in", b.State)
+	assert.Nil(t, b.LastEvent)
+
+	events = listEvents(t, srv, "U-3").Events
+	require.Len(t, events, 3)
+	for _, ev := range events {
+		assert.NotNil(t, ev.UndoneAt, "event %d must carry its undo audit", ev.ID)
+		assert.NotNil(t, ev.UndoReason)
+	}
+}
+
+func TestUndoNonLastEventRejected(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-4", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-4", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "U-4", "return", "2026-09-13T08:00:20Z")
+
+	events := listEvents(t, srv, "U-4").Events
+	require.Len(t, events, 2)
+
+	code, _, e := undoEvent(t, srv, "U-4", events[0].ID, "2026-09-13T08:00:30Z", "非最近记录")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "not_last_event", e.Error.Code)
+
+	// The rejected undo changed nothing.
+	b := getBatch(t, srv, "U-4")
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(10), b.AccumulatedSeconds)
+	events = listEvents(t, srv, "U-4").Events
+	require.Len(t, events, 2)
+	for _, ev := range events {
+		assert.Nil(t, ev.UndoneAt)
+	}
+}
+
+func TestUndoAlreadyUndoneRejected(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-5", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-5", "takeout", "2026-09-13T08:00:10Z")
+	events := listEvents(t, srv, "U-5").Events
+
+	code, _, _ := undoEvent(t, srv, "U-5", events[0].ID, "2026-09-13T08:00:20Z", "误扫取出")
+	require.Equal(t, http.StatusOK, code)
+
+	code, _, e := undoEvent(t, srv, "U-5", events[0].ID, "2026-09-13T08:00:21Z", "重复撤销")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "already_undone", e.Error.Code)
+
+	b := getBatch(t, srv, "U-5")
+	assert.Equal(t, "in", b.State)
+	events = listEvents(t, srv, "U-5").Events
+	require.Len(t, events, 1)
+	assert.Equal(t, "2026-09-13T08:00:20Z", *events[0].UndoneAt, "the first undo audit is kept")
+}
+
+func TestUndoTimeBeforeLastOperationRejected(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-6", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-6", "takeout", "2026-09-13T08:00:10Z")
+	events := listEvents(t, srv, "U-6").Events
+
+	code, _, e := undoEvent(t, srv, "U-6", events[0].ID, "2026-09-13T08:00:09Z", "时刻早于最后操作")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "time_not_monotonic", e.Error.Code)
+
+	b := getBatch(t, srv, "U-6")
+	assert.Equal(t, "out", b.State, "the rejected undo changed nothing")
+	assert.Nil(t, listEvents(t, srv, "U-6").Events[0].UndoneAt)
+
+	// A time equal to the last operation is not "earlier" and is accepted.
+	code, _, _ = undoEvent(t, srv, "U-6", events[0].ID, "2026-09-13T08:00:10Z", "误扫取出")
+	assert.Equal(t, http.StatusOK, code)
+}
+
+func TestUndoValidation(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-7", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-7", "takeout", "2026-09-13T08:00:10Z")
+	events := listEvents(t, srv, "U-7").Events
+	id := events[0].ID
+
+	// Malformed undo time.
+	code, _, e := undoEvent(t, srv, "U-7", id, "2026-09-13T08:00:20", "误扫")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "invalid_time", e.Error.Code)
+	code, _, e = undoEvent(t, srv, "U-7", id, "2026-09-13T08:00:20.5Z", "误扫")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "invalid_time", e.Error.Code)
+
+	// Empty / whitespace-only reason.
+	code, _, e = undoEvent(t, srv, "U-7", id, "2026-09-13T08:00:20Z", "")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "reason_required", e.Error.Code)
+	code, _, e = undoEvent(t, srv, "U-7", id, "2026-09-13T08:00:20Z", "   ")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "reason_required", e.Error.Code)
+
+	// Unknown batch / event / malformed id.
+	code, _, e = undoEvent(t, srv, "GHOST", id, "2026-09-13T08:00:20Z", "误扫")
+	assert.Equal(t, http.StatusNotFound, code)
+	assert.Equal(t, "not_found", e.Error.Code)
+	code, _, e = undoEvent(t, srv, "U-7", 9999, "2026-09-13T08:00:20Z", "误扫")
+	assert.Equal(t, http.StatusNotFound, code)
+	assert.Equal(t, "not_found", e.Error.Code)
+	code, raw := doJSON(t, http.MethodPost, srv.URL+"/api/batches/U-7/events/abc/undo",
+		map[string]string{"at": "2026-09-13T08:00:20Z", "reason": "误扫"})
+	assert.Equal(t, http.StatusBadRequest, code)
+	require.NoError(t, json.Unmarshal(raw, &e))
+	assert.Equal(t, "invalid_event_id", e.Error.Code)
+
+	// All rejections left the batch untouched.
+	b := getBatch(t, srv, "U-7")
+	assert.Equal(t, "out", b.State)
+	assert.Nil(t, listEvents(t, srv, "U-7").Events[0].UndoneAt)
+}
+
+func TestConcurrentUndoOnlyOneWins(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-8", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-8", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "U-8", "return", "2026-09-13T08:00:20Z") // +10
+	events := listEvents(t, srv, "U-8").Events
+	returnID := events[1].ID
+
+	const n = 8
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			raw, _ := json.Marshal(map[string]string{"at": "2026-09-13T08:00:30Z", "reason": "误扫归还"})
+			res, err := http.Post(srv.URL+"/api/batches/U-8/events/"+strconv.FormatInt(returnID, 10)+"/undo",
+				"application/json", bytes.NewReader(raw))
+			if err != nil {
+				codes[i] = -1
+				return
+			}
+			res.Body.Close()
+			codes[i] = res.StatusCode
+		}(i)
+	}
+	wg.Wait()
+
+	wins := 0
+	for _, c := range codes {
+		if c == http.StatusOK {
+			wins++
+		} else {
+			assert.Equal(t, http.StatusConflict, c)
+		}
+	}
+	assert.Equal(t, 1, wins, "two stations undoing the same event: exactly one may commit")
+
+	b := getBatch(t, srv, "U-8")
+	assert.Equal(t, "out", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds, "the exposure is subtracted back exactly once")
+	events = listEvents(t, srv, "U-8").Events
+	require.Len(t, events, 2)
+	require.NotNil(t, events[1].UndoneAt)
+	assert.Equal(t, "2026-09-13T08:00:30Z", *events[1].UndoneAt)
+}
+
+func TestUndoSurvivesReopen(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "undo.db")
+
+	st, err := store.Open(context.Background(), dbPath)
+	require.NoError(t, err)
+	srv := httptest.NewServer(app.NewRouter(st))
+	createBatch(t, srv, "U-9", 10, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-9", "takeout", "2026-09-13T08:00:05Z")
+	postEvent(t, srv, "U-9", "return", "2026-09-13T08:00:16Z") // scraps
+	events := listEvents(t, srv, "U-9").Events
+	code, _, _ := undoEvent(t, srv, "U-9", events[1].ID, "2026-09-13T08:00:20Z", "误扫归还")
+	require.Equal(t, http.StatusOK, code)
+	srv.Close()
+	require.NoError(t, st.Close())
+
+	st2, err := store.Open(context.Background(), dbPath)
+	require.NoError(t, err)
+	defer st2.Close()
+	srv2 := httptest.NewServer(app.NewRouter(st2))
+	defer srv2.Close()
+
+	b := getBatch(t, srv2, "U-9")
+	assert.Equal(t, "out", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+	assert.Equal(t, "usable", b.Status)
+	require.NotNil(t, b.LastEvent)
+	assert.Equal(t, "takeout", b.LastEvent.Type)
+	events = listEvents(t, srv2, "U-9").Events
+	require.Len(t, events, 2)
+	require.NotNil(t, events[1].UndoneAt)
+	assert.Equal(t, "误扫归还", *events[1].UndoReason)
+}
+
+// Old clients ignore the new undo fields: creating, querying and submitting
+// events keep working against the migrated schema and the extended JSON.
+func TestUndoFieldsAreAdditiveForOldClients(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "U-10", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "U-10", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "U-10", "return", "2026-09-13T08:00:20Z")
+
+	// Active events carry null undo fields.
+	events := listEvents(t, srv, "U-10").Events
+	require.Len(t, events, 2)
+	for _, ev := range events {
+		assert.Nil(t, ev.UndoneAt)
+		assert.Nil(t, ev.UndoReason)
+	}
+	b := getBatch(t, srv, "U-10")
+	require.NotNil(t, b.LastEvent)
+	assert.Nil(t, b.LastEvent.UndoneAt)
+
+	// Undoing does not break subsequent classic operations.
+	code, _, _ := undoEvent(t, srv, "U-10", events[1].ID, "2026-09-13T08:00:30Z", "误扫归还")
+	require.Equal(t, http.StatusOK, code)
+	code, b2, _ := postEvent(t, srv, "U-10", "return", "2026-09-13T08:00:40Z")
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, int64(30), b2.AccumulatedSeconds)
+	assert.Equal(t, "in", b2.State)
 }

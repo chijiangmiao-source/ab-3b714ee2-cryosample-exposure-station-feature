@@ -1,8 +1,8 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { api } from './api'
 import { isValidZ, nowZ } from './lib/time'
-import { eventTypeLabel } from './lib/derive'
+import { eventTypeLabel, isUndone, undoableEvent } from './lib/derive'
 import BatchCard from './components/BatchCard.vue'
 
 const barcode = ref('')
@@ -31,6 +31,7 @@ async function lookup() {
   error.value = ''
   info.value = ''
   showCreate.value = false
+  undoTarget.value = null
   const code = barcode.value.trim()
   if (!code) {
     error.value = '请输入或扫描批次条码'
@@ -112,6 +113,7 @@ async function act(type) {
   try {
     batch.value = await api.postEvent(batch.value.barcode, { type, at })
     await refreshEvents()
+    undoTarget.value = null // the new event is now the latest one
     info.value = type === 'takeout' ? '已取出（柜外计时开始）' : '已归还（本次暴露已计入）'
     // Only reset the field when it still holds the submitted value, so a
     // fast follow-up edit made while the request was in flight survives.
@@ -135,6 +137,63 @@ async function act(type) {
 
 function resetEventTime() {
   eventTime.value = nowZ()
+}
+
+// Undo of a mis-scanned event: only the latest non-undone event can be
+// undone, and the operator must supply the undo time and a non-empty reason.
+const undoTarget = ref(null) // id of the event the undo form is open for
+const undoTime = ref('')
+const undoReason = ref('')
+
+const undoableId = computed(() => undoableEvent(events.value)?.id ?? null)
+
+function openUndo(ev) {
+  error.value = ''
+  info.value = ''
+  undoTarget.value = ev.id
+  undoTime.value = nowZ()
+  undoReason.value = ''
+}
+
+function cancelUndo() {
+  undoTarget.value = null
+}
+
+async function submitUndo() {
+  error.value = ''
+  info.value = ''
+  if (!batch.value || undoTarget.value == null) return
+  if (!isValidZ(undoTime.value)) {
+    error.value = '撤销时刻必须是带 Z 的 RFC3339 整秒，如 2026-09-13T08:00:00Z'
+    return
+  }
+  const reason = undoReason.value.trim()
+  if (!reason) {
+    error.value = '请填写撤销原因（留档可追溯）'
+    return
+  }
+  busy.value = true
+  try {
+    batch.value = await api.undoEvent(batch.value.barcode, undoTarget.value, {
+      at: undoTime.value,
+      reason
+    })
+    await refreshEvents()
+    undoTarget.value = null
+    info.value = '已撤销该事件，批次状态已回退（流水保留撤销记录）'
+  } catch (e) {
+    // 409 etc.: show the conflict, then reload the authoritative state so a
+    // racing undo from another station can never display stale numbers.
+    error.value = `撤销被拒绝（${e.code}）：${e.message}`
+    try {
+      batch.value = await api.getBatch(batch.value.barcode)
+      await refreshEvents()
+    } catch {
+      /* keep previous state */
+    }
+  } finally {
+    busy.value = false
+  }
 }
 
 onMounted(async () => {
@@ -196,15 +255,49 @@ onMounted(async () => {
         <h2>事件记录</h2>
         <table v-if="events.length" data-test="events-table">
           <thead>
-            <tr><th>#</th><th>类型</th><th>时刻</th><th>本次暴露</th></tr>
+            <tr><th>#</th><th>类型</th><th>时刻</th><th>本次暴露</th><th>撤销</th></tr>
           </thead>
           <tbody>
-            <tr v-for="ev in events" :key="ev.id" :data-test="`event-row-${ev.id}`">
-              <td>{{ ev.id }}</td>
-              <td>{{ eventTypeLabel(ev.type) }}</td>
-              <td>{{ ev.at }}</td>
-              <td>{{ ev.deltaSeconds != null ? `+${ev.deltaSeconds} 秒` : '—' }}</td>
-            </tr>
+            <template v-for="ev in events" :key="ev.id">
+              <tr :data-test="`event-row-${ev.id}`" :class="{ undone: isUndone(ev) }">
+                <td>{{ ev.id }}</td>
+                <td>{{ eventTypeLabel(ev.type) }}</td>
+                <td>{{ ev.at }}</td>
+                <td>{{ ev.deltaSeconds != null ? `+${ev.deltaSeconds} 秒` : '—' }}</td>
+                <td>
+                  <span v-if="isUndone(ev)" class="undo-audit" :data-test="`undo-audit-${ev.id}`">
+                    已撤销 @ {{ ev.undoneAt }}<br />原因：{{ ev.undoReason }}
+                  </span>
+                  <button
+                    v-else-if="ev.id === undoableId"
+                    type="button"
+                    class="undo-btn"
+                    data-test="undo-btn"
+                    :disabled="busy"
+                    @click="openUndo(ev)"
+                  >撤销</button>
+                  <span v-else>—</span>
+                </td>
+              </tr>
+              <tr v-if="undoTarget === ev.id" class="undo-form-row" data-test="undo-form-row">
+                <td colspan="5">
+                  <form class="undo-form" data-test="undo-form" @submit.prevent="submitUndo">
+                    <label>
+                      撤销时刻（RFC3339 Z 整秒）
+                      <input v-model="undoTime" data-test="undo-time" placeholder="2026-09-13T08:00:00Z" />
+                    </label>
+                    <label>
+                      撤销原因（必填，留档可追溯）
+                      <input v-model="undoReason" data-test="undo-reason" placeholder="例如：误扫归还" />
+                    </label>
+                    <div class="undo-actions">
+                      <button type="submit" data-test="undo-confirm" :disabled="busy">确认撤销</button>
+                      <button type="button" data-test="undo-cancel" :disabled="busy" @click="cancelUndo">取消</button>
+                    </div>
+                  </form>
+                </td>
+              </tr>
+            </template>
           </tbody>
         </table>
         <p v-else data-test="events-empty">尚无事件</p>
@@ -261,4 +354,13 @@ dd.usable { color: #137333; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #edf1f6; }
 th { color: #5b6b7c; font-weight: 600; }
+tr.undone td { color: #8a97a5; }
+.undo-audit { font-size: 12px; line-height: 1.5; }
+.undo-btn { background: #6b4fbb; border-color: #6b4fbb; padding: 4px 12px; font-size: 12px; }
+.undo-form-row td { background: #f7f5fc; }
+.undo-form { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; }
+.undo-form label { flex: 1; min-width: 180px; font-size: 12px; color: #5b6b7c; }
+.undo-form input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; color: #1c2733; }
+.undo-actions { display: flex; gap: 8px; }
+.undo-actions [data-test="undo-cancel"] { background: #fff; color: #1c2733; border-color: #b9c4d0; }
 </style>

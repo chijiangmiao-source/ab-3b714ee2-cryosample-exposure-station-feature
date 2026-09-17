@@ -3,10 +3,12 @@ import {
   canReturn,
   canTakeout,
   eventTypeLabel,
+  isUndone,
   isUsable,
   remainingSeconds,
   stateLabel,
-  statusLabel
+  statusLabel,
+  undoableEvent
 } from '../src/lib/derive'
 
 const base = {
@@ -58,5 +60,21 @@ describe('derive', () => {
   it('event type labels', () => {
     expect(eventTypeLabel('takeout')).toBe('取出')
     expect(eventTypeLabel('return')).toBe('归还')
+  })
+
+  it('isUndone detects events that carry an undo timestamp', () => {
+    expect(isUndone({ id: 1, undoneAt: null })).toBe(false)
+    expect(isUndone({ id: 1, undoneAt: '2026-09-13T08:10:00Z' })).toBe(true)
+    expect(isUndone(null)).toBe(false)
+  })
+
+  it('undoableEvent returns the last non-undone event only', () => {
+    const e1 = { id: 1, undoneAt: null }
+    const e2 = { id: 2, undoneAt: null }
+    expect(undoableEvent([e1, e2])).toBe(e2)
+    expect(undoableEvent([e1, { ...e2, undoneAt: '2026-09-13T08:10:00Z' }])).toBe(e1)
+    expect(undoableEvent([{ ...e1, undoneAt: '2026-09-13T08:10:00Z' }])).toBe(null)
+    expect(undoableEvent([])).toBe(null)
+    expect(undoableEvent(null)).toBe(null)
   })
 })

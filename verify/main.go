@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,10 +51,22 @@ type batch struct {
 	RemainingSeconds   int64  `json:"remainingSeconds"`
 	CreatedAt          string `json:"createdAt"`
 	LastEvent          *struct {
-		Type         string `json:"type"`
-		At           string `json:"at"`
-		DeltaSeconds *int64 `json:"deltaSeconds"`
+		ID           int64   `json:"id"`
+		Type         string  `json:"type"`
+		At           string  `json:"at"`
+		DeltaSeconds *int64  `json:"deltaSeconds"`
+		UndoneAt     *string `json:"undoneAt"`
+		UndoReason   *string `json:"undoReason"`
 	} `json:"lastEvent"`
+}
+
+type eventRow struct {
+	ID           int64   `json:"id"`
+	Type         string  `json:"type"`
+	At           string  `json:"at"`
+	DeltaSeconds *int64  `json:"deltaSeconds"`
+	UndoneAt     *string `json:"undoneAt"`
+	UndoReason   *string `json:"undoReason"`
 }
 
 type apiErr struct {
@@ -94,6 +107,24 @@ func postEvent(barcode, typ, at string) (int, batch, apiErr) {
 		"type": typ, "at": at,
 	})
 	return decodeBatch(code, raw)
+}
+
+func undoEvent(barcode string, id int64, at, reason string) (int, batch, apiErr) {
+	code, raw := do("POST", apiBase+"/batches/"+barcode+"/events/"+strconv.FormatInt(id, 10)+"/undo",
+		map[string]string{"at": at, "reason": reason})
+	return decodeBatch(code, raw)
+}
+
+func listEvents(barcode string) []eventRow {
+	code, raw := do("GET", apiBase+"/batches/"+barcode+"/events", nil)
+	if code != 200 {
+		return nil
+	}
+	var res struct {
+		Events []eventRow `json:"events"`
+	}
+	_ = json.Unmarshal(raw, &res)
+	return res.Events
 }
 
 func decodeBatch(code int, raw []byte) (int, batch, apiErr) {
@@ -250,6 +281,126 @@ func main() {
 	check("final state of scrapped batch is re-readable",
 		b.State == "in" && b.Status == "scrapped" && b.AccumulatedSeconds == 11 && b.LastEvent != nil && b.LastEvent.Type == "return",
 		fmt.Sprintf("state=%s status=%s acc=%d", b.State, b.Status, b.AccumulatedSeconds))
+
+	// 5. Main undo flow: a mis-scanned return scraps the batch; undoing it
+	// restores the out-of-cabinet state with the original accumulated total.
+	b3 := fmt.Sprintf("VERIFY-C-%d", uniq)
+	createBatch(b3, 10, "2026-01-01T00:00:00Z")
+	postEvent(b3, "takeout", "2026-01-01T00:00:05Z")
+	code, b, _ = postEvent(b3, "return", "2026-01-01T00:00:16Z") // +11 > 10
+	check("mis-scanned over-limit return scraps the batch",
+		code == 201 && b.Status == "scrapped" && b.AccumulatedSeconds == 11,
+		fmt.Sprintf("status=%d batchStatus=%s acc=%d", code, b.Status, b.AccumulatedSeconds))
+
+	evs := listEvents(b3)
+	returnID := evs[1].ID
+	code, b, _ = undoEvent(b3, returnID, "2026-01-01T00:00:20Z", "误扫归还")
+	check("undo mistaken return restores out-of-cabinet + original accumulated",
+		code == 200 && b.State == "out" && b.AccumulatedSeconds == 0 && b.Status == "usable" && b.Usable,
+		fmt.Sprintf("status=%d state=%s acc=%d batchStatus=%s", code, b.State, b.AccumulatedSeconds, b.Status))
+
+	evs = listEvents(b3)
+	check("undone event keeps undo time and reason in the audit trail",
+		len(evs) == 2 && evs[0].UndoneAt == nil &&
+			evs[1].UndoneAt != nil && *evs[1].UndoneAt == "2026-01-01T00:00:20Z" &&
+			evs[1].UndoReason != nil && *evs[1].UndoReason == "误扫归还",
+		fmt.Sprintf("events=%v", evs))
+	_, b = getBatch(b3)
+	check("lastEvent falls back to the still-active takeout",
+		b.LastEvent != nil && b.LastEvent.Type == "takeout" && b.LastEvent.At == "2026-01-01T00:00:05Z",
+		fmt.Sprintf("lastEvent=%+v", b.LastEvent))
+
+	code, b, _ = postEvent(b3, "return", "2026-01-01T00:00:14Z")
+	check("batch can be returned correctly after the undo",
+		code == 201 && b.State == "in" && b.AccumulatedSeconds == 9 && b.Status == "usable",
+		fmt.Sprintf("status=%d state=%s acc=%d batchStatus=%s", code, b.State, b.AccumulatedSeconds, b.Status))
+
+	// 6. Undo of a mis-scanned takeout puts the batch back into the cabinet.
+	b4 := fmt.Sprintf("VERIFY-D-%d", uniq)
+	createBatch(b4, 100, "2026-01-01T00:00:00Z")
+	postEvent(b4, "takeout", "2026-01-01T00:00:05Z")
+	evs = listEvents(b4)
+	code, b, _ = undoEvent(b4, evs[0].ID, "2026-01-01T00:00:06Z", "误扫取出")
+	check("undo takeout returns the batch to the cabinet",
+		code == 200 && b.State == "in" && b.AccumulatedSeconds == 0 && b.LastEvent == nil,
+		fmt.Sprintf("status=%d state=%s acc=%d", code, b.State, b.AccumulatedSeconds))
+	code, b, _ = postEvent(b4, "takeout", "2026-01-01T00:00:07Z")
+	check("takeout works again after the undo", code == 201 && b.State == "out",
+		fmt.Sprintf("status=%d state=%s", code, b.State))
+
+	// 7. Undo rejections are clear conflicts and write nothing.
+	b5 := fmt.Sprintf("VERIFY-E-%d", uniq)
+	createBatch(b5, 100, "2026-01-01T00:00:00Z")
+	postEvent(b5, "takeout", "2026-01-01T00:00:05Z")
+	postEvent(b5, "return", "2026-01-01T00:00:10Z") // +5
+	evs = listEvents(b5)
+
+	code, _, e = undoEvent(b5, evs[0].ID, "2026-01-01T00:00:11Z", "非最近记录")
+	check("undoing a non-last event -> 409", code == 409 && e.Error.Code == "not_last_event",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, b, _ = undoEvent(b5, evs[1].ID, "2026-01-01T00:00:11Z", "误扫归还")
+	check("undo last return succeeds", code == 200 && b.State == "out" && b.AccumulatedSeconds == 0,
+		fmt.Sprintf("status=%d state=%s acc=%d", code, b.State, b.AccumulatedSeconds))
+
+	code, _, e = undoEvent(b5, evs[1].ID, "2026-01-01T00:00:12Z", "重复撤销")
+	check("duplicate undo -> 409", code == 409 && e.Error.Code == "already_undone",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, _, e = undoEvent(b5, evs[0].ID, "2026-01-01T00:00:04Z", "时刻早于最后操作")
+	check("undo time earlier than last operation -> 409", code == 409 && e.Error.Code == "time_not_monotonic",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, _, e = undoEvent(b5, evs[0].ID, "2026-01-01T00:00:12Z", "   ")
+	check("empty undo reason -> 400", code == 400 && e.Error.Code == "reason_required",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, _, e = undoEvent(b5, evs[0].ID, "2026-01-01 00:00:12", "误扫")
+	check("malformed undo time -> 400", code == 400 && e.Error.Code == "invalid_time",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, _, e = undoEvent(b5, 999999, "2026-01-01T00:00:12Z", "误扫")
+	check("undo unknown event -> 404", code == 404 && e.Error.Code == "not_found",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	code, _, e = undoEvent("VERIFY-GHOST", 1, "2026-01-01T00:00:12Z", "误扫")
+	check("undo on unknown batch -> 404", code == 404 && e.Error.Code == "not_found",
+		fmt.Sprintf("status=%d code=%s", code, e.Error.Code))
+
+	_, b = getBatch(b5)
+	check("rejected undos changed nothing",
+		b.State == "out" && b.AccumulatedSeconds == 0 && eventCount(b5) == 2,
+		fmt.Sprintf("state=%s acc=%d events=%d", b.State, b.AccumulatedSeconds, eventCount(b5)))
+
+	// 8. Two stations undoing the same event concurrently: exactly one wins.
+	b6 := fmt.Sprintf("VERIFY-F-%d", uniq)
+	createBatch(b6, 100, "2026-01-01T00:00:00Z")
+	postEvent(b6, "takeout", "2026-01-01T00:00:05Z")
+	postEvent(b6, "return", "2026-01-01T00:00:10Z") // +5
+	evs = listEvents(b6)
+	returnID = evs[1].ID
+	for i := range codes {
+		codes[i] = 0
+	}
+	for i := 0; i < racers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			c, _, _ := undoEvent(b6, returnID, "2026-01-01T00:00:11Z", "误扫归还")
+			codes[i] = c
+		}(i)
+	}
+	wg.Wait()
+	check("racing undos: exactly one wins", countCode(codes, 200) == 1 && countCode(codes, 409) == racers-1,
+		fmt.Sprintf("codes=%v", codes))
+	_, b = getBatch(b6)
+	check("racing undos restored the exposure exactly once",
+		b.State == "out" && b.AccumulatedSeconds == 0,
+		fmt.Sprintf("state=%s acc=%d", b.State, b.AccumulatedSeconds))
+	evs = listEvents(b6)
+	check("race left exactly one undo audit",
+		len(evs) == 2 && evs[0].UndoneAt == nil && evs[1].UndoneAt != nil && *evs[1].UndoneAt == "2026-01-01T00:00:11Z",
+		fmt.Sprintf("events=%v", evs))
 
 	if failures > 0 {
 		fmt.Printf("\nverify: %d check(s) FAILED\n", failures)

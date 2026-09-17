@@ -32,3 +32,17 @@ export function statusLabel(batch) {
 export function eventTypeLabel(type) {
   return type === 'takeout' ? '取出' : type === 'return' ? '归还' : type
 }
+
+/** 事件是否已被撤销（误扫更正后仍留档）。 */
+export function isUndone(ev) {
+  return !!ev && ev.undoneAt != null
+}
+
+/** 当前允许撤销的事件：流水中最后一条未撤销记录，没有则为 null。 */
+export function undoableEvent(events) {
+  if (!Array.isArray(events)) return null
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (!isUndone(events[i])) return events[i]
+  }
+  return null
+}

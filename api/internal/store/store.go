@@ -65,13 +65,16 @@ type Batch struct {
 	LastTakeoutAt      *time.Time // open takeout time, set while State == StateOut
 }
 
-// Event is one accepted takeout/return record.
+// Event is one accepted takeout/return record. A mis-scanned event can be
+// undone: the row is kept for audit and carries the undo time and reason.
 type Event struct {
 	ID           int64
 	Barcode      string
 	Type         string
 	At           time.Time
-	DeltaSeconds *int64 // exposure seconds added by a return; NULL for takeouts
+	DeltaSeconds *int64     // exposure seconds added by a return; NULL for takeouts
+	UndoneAt     *time.Time // set when the event was undone; NULL while active
+	UndoReason   *string    // operator-supplied reason recorded with the undo
 }
 
 // Store wraps the SQLite handle.
@@ -118,7 +121,9 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			barcode       TEXT NOT NULL REFERENCES batches (barcode),
 			type          TEXT NOT NULL CHECK (type IN ('takeout', 'return')),
 			at            TEXT NOT NULL,
-			delta_seconds INTEGER
+			delta_seconds INTEGER,
+			undone_at     TEXT,
+			undo_reason   TEXT
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_barcode ON events (barcode, id)`,
 	}
@@ -127,7 +132,48 @@ func migrate(ctx context.Context, db *sql.DB) error {
 			return err
 		}
 	}
+	// Databases created before the undo feature lack the audit columns;
+	// add them idempotently (SQLite has no ADD COLUMN IF NOT EXISTS).
+	if err := ensureColumn(ctx, db, "events", "undone_at", "undone_at TEXT"); err != nil {
+		return err
+	}
+	if err := ensureColumn(ctx, db, "events", "undo_reason", "undo_reason TEXT"); err != nil {
+		return err
+	}
 	return nil
+}
+
+// ensureColumn adds column definition to table when it is missing.
+func ensureColumn(ctx context.Context, db *sql.DB, table, column, definition string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	found := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, ctype string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == column {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	_, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+definition)
+	return err
 }
 
 // ts formats a timestamp the way it is stored: RFC3339 whole seconds, UTC.
@@ -207,13 +253,16 @@ func scanBatch(row *sql.Row) (*Batch, error) {
 	return &b, nil
 }
 
-// ListEvents returns all accepted events of a batch in insertion order.
+const eventCols = `id, barcode, type, at, delta_seconds, undone_at, undo_reason`
+
+// ListEvents returns all accepted events of a batch in insertion order,
+// including undone ones (the audit trail is never removed).
 func (s *Store) ListEvents(ctx context.Context, barcode string) ([]Event, error) {
 	if _, err := s.GetBatch(ctx, barcode); err != nil {
 		return nil, err
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, barcode, type, at, delta_seconds FROM events WHERE barcode = ? ORDER BY id`, barcode)
+		`SELECT `+eventCols+` FROM events WHERE barcode = ? ORDER BY id`, barcode)
 	if err != nil {
 		return nil, err
 	}
@@ -229,30 +278,18 @@ func (s *Store) ListEvents(ctx context.Context, barcode string) ([]Event, error)
 	return out, rows.Err()
 }
 
-// LastEvent returns the most recent event of a batch, or nil when none.
+// LastEvent returns the most recent still-active (non-undone) event of a
+// batch, or nil when none. Undone events no longer describe the batch state.
 func (s *Store) LastEvent(ctx context.Context, barcode string) (*Event, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, barcode, type, at, delta_seconds FROM events WHERE barcode = ? ORDER BY id DESC LIMIT 1`, barcode)
-	var ev Event
-	var at string
-	var delta sql.NullInt64
-	err := row.Scan(&ev.ID, &ev.Barcode, &ev.Type, &at, &delta)
+	ev, err := scanEvent(s.db.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE barcode = ? AND undone_at IS NULL ORDER BY id DESC LIMIT 1`, barcode))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	t, err := parseTS(at)
-	if err != nil {
-		return nil, err
-	}
-	ev.At = t
-	if delta.Valid {
-		d := delta.Int64
-		ev.DeltaSeconds = &d
-	}
-	return &ev, nil
+	return ev, nil
 }
 
 type scanner interface {
@@ -263,7 +300,8 @@ func scanEvent(row scanner) (*Event, error) {
 	var ev Event
 	var at string
 	var delta sql.NullInt64
-	if err := row.Scan(&ev.ID, &ev.Barcode, &ev.Type, &at, &delta); err != nil {
+	var undoneAt, undoReason sql.NullString
+	if err := row.Scan(&ev.ID, &ev.Barcode, &ev.Type, &at, &delta, &undoneAt, &undoReason); err != nil {
 		return nil, err
 	}
 	t, err := parseTS(at)
@@ -274,6 +312,17 @@ func scanEvent(row scanner) (*Event, error) {
 	if delta.Valid {
 		d := delta.Int64
 		ev.DeltaSeconds = &d
+	}
+	if undoneAt.Valid {
+		u, err := parseTS(undoneAt.String)
+		if err != nil {
+			return nil, err
+		}
+		ev.UndoneAt = &u
+	}
+	if undoReason.Valid {
+		r := undoReason.String
+		ev.UndoReason = &r
 	}
 	return &ev, nil
 }
@@ -354,6 +403,141 @@ func (s *Store) ApplyEvent(ctx context.Context, barcode, eventType string, at ti
 		`INSERT INTO events (barcode, type, at, delta_seconds) VALUES (?, ?, ?, ?)`,
 		barcode, eventType, ts(at), delta); err != nil {
 		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return s.GetBatch(ctx, barcode)
+}
+
+// UndoEvent reverses the batch's most recent still-active event inside a
+// single transaction: the event row keeps its audit trail (undone_at +
+// reason) and the batch aggregate is restored to its state before that
+// event. Undoing a takeout puts the batch back into the cabinet; undoing a
+// return puts it back outside, subtracts the exposure that return had added
+// and re-judges usability from the restored total. Only the last non-undone
+// event may be undone; rejected undos write nothing.
+func (s *Store) UndoEvent(ctx context.Context, barcode string, eventID int64, at time.Time, reason string) (*Batch, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	b, err := scanBatch(tx.QueryRowContext(ctx,
+		`SELECT `+batchCols+` FROM batches WHERE barcode = ?`, barcode))
+	if err != nil {
+		return nil, err
+	}
+
+	ev, err := scanEvent(tx.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE id = ? AND barcode = ?`, eventID, barcode))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if ev.UndoneAt != nil {
+		return nil, conflict("already_undone", "event %d was already undone", ev.ID)
+	}
+
+	// Only the current last non-undone event may be undone.
+	var lastID int64
+	err = tx.QueryRowContext(ctx,
+		`SELECT id FROM events WHERE barcode = ? AND undone_at IS NULL ORDER BY id DESC LIMIT 1`,
+		barcode).Scan(&lastID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, conflict("not_last_event", "event %d is not the latest active event", ev.ID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if lastID != ev.ID {
+		return nil, conflict("not_last_event",
+			"event %d is not the latest active event (only event %d can be undone)", ev.ID, lastID)
+	}
+
+	// The undo cannot be dated before the batch's last operation.
+	if at.Before(b.LastAt) {
+		return nil, conflict("time_not_monotonic",
+			"undo time %s must not be earlier than the batch's last operation time %s",
+			ts(at), ts(b.LastAt))
+	}
+
+	// The previous still-active event defines the state to restore.
+	prev, err := scanEvent(tx.QueryRowContext(ctx,
+		`SELECT `+eventCols+` FROM events WHERE barcode = ? AND undone_at IS NULL AND id < ? ORDER BY id DESC LIMIT 1`,
+		barcode, ev.ID))
+	if errors.Is(err, sql.ErrNoRows) {
+		prev = nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	// Restore the "last" markers to the previous active event (or creation).
+	lastAt := b.CreatedAt
+	var lastType, lastEventAt sql.NullString
+	if prev != nil {
+		lastAt = prev.At
+		lastType = sql.NullString{String: prev.Type, Valid: true}
+		lastEventAt = sql.NullString{String: ts(prev.At), Valid: true}
+	}
+
+	switch ev.Type {
+	case EventTakeout:
+		res, err := tx.ExecContext(ctx, `UPDATE batches
+			SET state = ?, last_at = ?, last_event_type = ?, last_event_at = ?, last_takeout_at = NULL
+			WHERE barcode = ? AND state = ? AND last_at = ?`,
+			StateIn, ts(lastAt), lastType, lastEventAt,
+			barcode, StateOut, ts(b.LastAt))
+		if err != nil {
+			return nil, err
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return nil, conflict("invalid_transition", "batch state changed concurrently; retry")
+		}
+
+	case EventReturn:
+		// The event before a return is always its matching takeout.
+		if prev == nil || prev.Type != EventTakeout {
+			return nil, fmt.Errorf("return event %d has no matching takeout", ev.ID)
+		}
+		if ev.DeltaSeconds == nil {
+			return nil, fmt.Errorf("return event %d has no recorded exposure", ev.ID)
+		}
+		newAccumulated := b.AccumulatedSeconds - *ev.DeltaSeconds
+		newStatus := StatusUsable
+		if newAccumulated > b.AllowedSeconds {
+			newStatus = StatusScrapped
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE batches
+			SET state = ?, accumulated_seconds = ?, status = ?,
+			    last_at = ?, last_event_type = ?, last_event_at = ?, last_takeout_at = ?
+			WHERE barcode = ? AND state = ? AND last_at = ?`,
+			StateOut, newAccumulated, newStatus,
+			ts(lastAt), lastType, lastEventAt, ts(prev.At),
+			barcode, StateIn, ts(b.LastAt))
+		if err != nil {
+			return nil, err
+		}
+		if n, err := res.RowsAffected(); err != nil || n != 1 {
+			return nil, conflict("invalid_transition", "batch state changed concurrently; retry")
+		}
+
+	default:
+		return nil, fmt.Errorf("unknown event type %q", ev.Type)
+	}
+
+	res, err := tx.ExecContext(ctx,
+		`UPDATE events SET undone_at = ?, undo_reason = ? WHERE id = ? AND undone_at IS NULL`,
+		ts(at), reason, ev.ID)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil || n != 1 {
+		return nil, conflict("already_undone", "event %d was already undone", ev.ID)
 	}
 
 	if err := tx.Commit(); err != nil {
