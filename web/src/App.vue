@@ -1,5 +1,5 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { api } from './api'
 import { isValidZ, nowZ } from './lib/time'
 import { eventTypeLabel } from './lib/derive'
@@ -16,10 +16,24 @@ const busy = ref(false)
 // so boundary conditions can be demonstrated and tested deterministically.
 const eventTime = ref(nowZ())
 
+// Revocation form: undoing the latest mis-scanned event needs its own
+// whole-second Z timestamp and a non-empty audit reason.
+const revokeTime = ref(nowZ())
+const revokeReason = ref('')
+
 // Create form (shown when the scanned barcode is unknown).
 const showCreate = ref(false)
 const createAllowed = ref(60)
 const createCreatedAt = ref('')
+
+// lastActiveEvent is the most recent ledger row that is still in force.
+// Revocation is offered only for this row; older rows are history.
+const lastActiveEvent = computed(() => {
+  for (let i = events.value.length - 1; i >= 0; i--) {
+    if (!events.value[i].revokedAt) return events.value[i]
+  }
+  return null
+})
 
 async function refreshEvents() {
   if (!batch.value) return
@@ -42,6 +56,8 @@ async function lookup() {
     localStorage.setItem('lastBarcode', code)
     await refreshEvents()
     eventTime.value = nowZ()
+    revokeTime.value = nowZ()
+    revokeReason.value = ''
   } catch (e) {
     batch.value = null
     events.value = []
@@ -81,6 +97,8 @@ async function submitCreate() {
     events.value = []
     info.value = '批次已创建：柜内，累计 0 秒'
     eventTime.value = nowZ()
+    revokeTime.value = nowZ()
+    revokeReason.value = ''
   } catch (e) {
     if (e.status === 409) {
       error.value = '该条码已存在，已为你载入现有批次'
@@ -135,6 +153,45 @@ async function act(type) {
 
 function resetEventTime() {
   eventTime.value = nowZ()
+}
+
+async function revoke(ev) {
+  error.value = ''
+  info.value = ''
+  if (!batch.value || !ev) return
+  if (!isValidZ(revokeTime.value)) {
+    error.value = '撤销时刻必须是带 Z 的 RFC3339 整秒，如 2026-09-13T08:00:00Z'
+    return
+  }
+  const reason = revokeReason.value.trim()
+  if (!reason) {
+    error.value = '请填写撤销原因（用于追溯）'
+    return
+  }
+  busy.value = true
+  const at = revokeTime.value
+  try {
+    batch.value = await api.revokeEvent(batch.value.barcode, ev.id, { at, reason })
+    await refreshEvents()
+    info.value = `已撤销 #${ev.id}（${eventTypeLabel(ev.type)}）：${ev.type === 'takeout' ? '批次回到柜内' : '已扣回该次暴露并恢复柜外状态'}`
+    revokeReason.value = ''
+    if (revokeTime.value === at) {
+      revokeTime.value = nowZ()
+    }
+  } catch (e) {
+    // 404/409 (non-last, duplicate revoke, stale time, concurrent change):
+    // show the conflict and reload authoritative state. Nothing local is
+    // mutated until the server accepts the revocation.
+    error.value = `撤销被拒绝（${e.code}）：${e.message}`
+    try {
+      batch.value = await api.getBatch(batch.value.barcode)
+      await refreshEvents()
+    } catch {
+      /* keep previous state */
+    }
+  } finally {
+    busy.value = false
+  }
 }
 
 onMounted(async () => {
@@ -196,18 +253,56 @@ onMounted(async () => {
         <h2>事件记录</h2>
         <table v-if="events.length" data-test="events-table">
           <thead>
-            <tr><th>#</th><th>类型</th><th>时刻</th><th>本次暴露</th></tr>
+            <tr><th>#</th><th>类型</th><th>时刻</th><th>本次暴露</th><th>状态 / 撤销审计</th><th></th></tr>
           </thead>
           <tbody>
-            <tr v-for="ev in events" :key="ev.id" :data-test="`event-row-${ev.id}`">
+            <tr
+              v-for="ev in events"
+              :key="ev.id"
+              :class="{ revoked: !!ev.revokedAt }"
+              :data-test="`event-row-${ev.id}`"
+            >
               <td>{{ ev.id }}</td>
               <td>{{ eventTypeLabel(ev.type) }}</td>
               <td>{{ ev.at }}</td>
               <td>{{ ev.deltaSeconds != null ? `+${ev.deltaSeconds} 秒` : '—' }}</td>
+              <td data-test="event-audit">
+                <template v-if="ev.revokedAt">
+                  <span class="revoked-tag" data-test="revoked-tag">已撤销</span>
+                  <span class="audit">@ {{ ev.revokedAt }}｜原因：{{ ev.revokeReason }}</span>
+                </template>
+                <template v-else>
+                  <span class="active-tag">有效</span>
+                </template>
+              </td>
+              <td>
+                <button
+                  v-if="lastActiveEvent && lastActiveEvent.id === ev.id"
+                  type="button"
+                  class="revoke"
+                  :data-test="`revoke-btn-${ev.id}`"
+                  :disabled="busy"
+                  @click="revoke(ev)"
+                >撤销此记录</button>
+              </td>
             </tr>
           </tbody>
         </table>
         <p v-else data-test="events-empty">尚无事件</p>
+
+        <form v-if="lastActiveEvent" class="revoke-form" data-test="revoke-form" @submit.prevent="revoke(lastActiveEvent)">
+          <h3>撤销最近事件 #{{ lastActiveEvent.id }}（{{ eventTypeLabel(lastActiveEvent.type) }}）</h3>
+          <p class="hint">仅可撤销当前最后一条未撤销记录；撤销取出后批次回到柜内，撤销归还则扣回该次暴露并恢复柜外状态。</p>
+          <label>
+            撤销时刻（RFC3339 Z 整秒，须晚于批次最后操作）
+            <input v-model="revokeTime" data-test="revoke-time" placeholder="2026-09-13T08:05:00Z" />
+          </label>
+          <label>
+            撤销原因（必填，用于追溯）
+            <input v-model="revokeReason" data-test="revoke-reason" placeholder="如：误扫，实际未取出/归还" />
+          </label>
+          <button type="submit" class="revoke" data-test="revoke-submit" :disabled="busy">确认撤销</button>
+        </form>
       </section>
     </template>
   </main>
@@ -261,4 +356,15 @@ dd.usable { color: #137333; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #edf1f6; }
 th { color: #5b6b7c; font-weight: 600; }
+tr.revoked td { color: #8a97a5; text-decoration: line-through; }
+tr.revoked td:last-child, tr.revoked .revoked-tag, tr.revoked .audit { text-decoration: none; }
+.revoked-tag { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #f1f3f5; color: #5b6b7c; font-weight: 600; }
+.active-tag { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #e6f4ea; color: #137333; font-weight: 600; }
+.audit { margin-left: 6px; color: #5b6b7c; }
+.revoke-form { margin-top: 16px; padding-top: 14px; border-top: 1px dashed #dde4ec; }
+.revoke-form h3 { font-size: 14px; margin: 0 0 4px; }
+.revoke-form label { display: block; margin: 8px 0; font-size: 13px; color: #5b6b7c; }
+.revoke-form input { display: block; width: 100%; box-sizing: border-box; margin-top: 4px; color: #1c2733; }
+button.revoke { background: #8a4b00; border-color: #8a4b00; }
+td button.revoke { padding: 4px 8px; font-size: 12px; }
 </style>

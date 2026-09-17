@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 
@@ -31,10 +32,12 @@ type batchResp struct {
 	RemainingSeconds   int64  `json:"remainingSeconds"`
 	CreatedAt          string `json:"createdAt"`
 	LastEvent          *struct {
-		ID           int64  `json:"id"`
-		Type         string `json:"type"`
-		At           string `json:"at"`
-		DeltaSeconds *int64 `json:"deltaSeconds"`
+		ID           int64   `json:"id"`
+		Type         string  `json:"type"`
+		At           string  `json:"at"`
+		DeltaSeconds *int64  `json:"deltaSeconds"`
+		RevokedAt    *string `json:"revokedAt"`
+		RevokeReason *string `json:"revokeReason"`
 	} `json:"lastEvent"`
 }
 
@@ -47,10 +50,12 @@ type errResp struct {
 
 type eventsResp struct {
 	Events []struct {
-		ID           int64  `json:"id"`
-		Type         string `json:"type"`
-		At           string `json:"at"`
-		DeltaSeconds *int64 `json:"deltaSeconds"`
+		ID           int64   `json:"id"`
+		Type         string  `json:"type"`
+		At           string  `json:"at"`
+		DeltaSeconds *int64  `json:"deltaSeconds"`
+		RevokedAt    *string `json:"revokedAt"`
+		RevokeReason *string `json:"revokeReason"`
 	} `json:"events"`
 }
 
@@ -548,4 +553,345 @@ func TestEventOnUnknownBatch(t *testing.T) {
 	code, _, e := postEvent(t, srv, "GHOST", "takeout", "2026-09-13T08:00:10Z")
 	assert.Equal(t, http.StatusNotFound, code)
 	assert.Equal(t, "not_found", e.Error.Code)
+}
+
+// --- revocation ---------------------------------------------------------------
+
+func revokeEvent(t *testing.T, srv *httptest.Server, barcode string, eventID int64, at, reason string) (int, batchResp, errResp) {
+	t.Helper()
+	code, raw := doJSON(t, http.MethodPost,
+		srv.URL+"/api/batches/"+barcode+"/events/"+strconv.FormatInt(eventID, 10)+"/revocation",
+		map[string]string{"at": at, "reason": reason})
+	var b batchResp
+	var e errResp
+	if code == http.StatusOK {
+		require.NoError(t, json.Unmarshal(raw, &b))
+	} else {
+		require.NoError(t, json.Unmarshal(raw, &e))
+	}
+	return code, b, e
+}
+
+// revokeRaw is a goroutine-safe variant returning (status, errorCode).
+func revokeRaw(srv *httptest.Server, barcode string, eventID int64, at, reason string) (int, string) {
+	raw, err := json.Marshal(map[string]string{"at": at, "reason": reason})
+	if err != nil {
+		return -1, err.Error()
+	}
+	res, err := http.Post(srv.URL+"/api/batches/"+barcode+"/events/"+
+		strconv.FormatInt(eventID, 10)+"/revocation", "application/json", bytes.NewReader(raw))
+	if err != nil {
+		return -1, err.Error()
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	if res.StatusCode != http.StatusOK {
+		var e errResp
+		if json.Unmarshal(body, &e) == nil {
+			return res.StatusCode, e.Error.Code
+		}
+	}
+	return res.StatusCode, ""
+}
+
+// Main acceptance flow: a mistaken return scraps the batch; revoking it
+// restores the out-of-cabinet state and the previous accumulated total, after
+// which a correct return works again.
+func TestRevokeMistakenReturnRestoresOutAndAccumulated(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-1", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-1", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "R-1", "return", "2026-09-13T08:00:30Z") // legitimate +20
+	postEvent(t, srv, "R-1", "takeout", "2026-09-13T08:00:40Z")
+
+	// Mistaken return: +90 would push accumulated to 110 and scrap the batch.
+	code, b, _ := postEvent(t, srv, "R-1", "return", "2026-09-13T08:02:10Z")
+	require.Equal(t, http.StatusCreated, code)
+	require.Equal(t, int64(110), b.AccumulatedSeconds)
+	require.Equal(t, "scrapped", b.Status)
+	require.Equal(t, "in", b.State)
+
+	// Revoke the mistaken return (event id 4) at a later time with a reason.
+	code, b, _ = revokeEvent(t, srv, "R-1", 4, "2026-09-13T08:03:00Z", "误扫归还，样本仍在柜外")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "out", b.State, "revoking a return restores out-of-cabinet state")
+	assert.Equal(t, "usable", b.Status, "restored accumulated 20 <= limit 100")
+	assert.True(t, b.Usable)
+	assert.Equal(t, int64(20), b.AccumulatedSeconds, "the revoked exposure is clawed back")
+	assert.Equal(t, int64(80), b.RemainingSeconds)
+	require.NotNil(t, b.LastEvent, "lastEvent reverts to the matching takeout")
+	assert.Equal(t, "takeout", b.LastEvent.Type)
+	assert.Equal(t, "2026-09-13T08:00:40Z", b.LastEvent.At)
+
+	// Ledger: 4 rows; the takeout (id 3) stays active, the mistaken return
+	// (id 4) is annotated with its revocation audit fields.
+	evs := listEvents(t, srv, "R-1")
+	require.Len(t, evs.Events, 4)
+	assert.Equal(t, int64(3), evs.Events[2].ID)
+	assert.Nil(t, evs.Events[2].RevokedAt, "the open takeout stays active")
+	revoked := evs.Events[3]
+	assert.Equal(t, int64(4), revoked.ID)
+	assert.Equal(t, "return", revoked.Type)
+	require.NotNil(t, revoked.RevokedAt)
+	assert.Equal(t, "2026-09-13T08:03:00Z", *revoked.RevokedAt)
+	require.NotNil(t, revoked.RevokeReason)
+	assert.Equal(t, "误扫归还，样本仍在柜外", *revoked.RevokeReason)
+
+	// The batch can now be returned correctly (timestamp later than the
+	// revocation). Exposure is recomputed from the reopened takeout, so this
+	// genuinely-long trip legitimately scraps again — but it is accepted as a
+	// normal return and counted exactly once, proving the machine recovered.
+	code, b, _ = postEvent(t, srv, "R-1", "return", "2026-09-13T08:03:10Z")
+	require.Equal(t, http.StatusCreated, code, "a correct return after undo works again")
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(170), b.AccumulatedSeconds, "20 (trip 1) + 150 (08:00:40 -> 08:03:10)")
+	assert.Len(t, listEvents(t, srv, "R-1").Events, 5, "new events append; revoked rows are retained")
+}
+
+// Undoing a mistaken (but not yet over-limit) return lets the operator redo it
+// with the real return time, ending usable within the budget.
+func TestRevokeMistakenReturnThenCorrectReturnStaysUsable(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-1b", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-1b", "takeout", "2026-09-13T08:00:05Z")
+	postEvent(t, srv, "R-1b", "return", "2026-09-13T08:00:35Z") // mistyped: +30
+	b := getBatch(t, srv, "R-1b")
+	require.Equal(t, int64(30), b.AccumulatedSeconds)
+	require.Equal(t, "in", b.State)
+
+	code, rb, _ := revokeEvent(t, srv, "R-1b", 2, "2026-09-13T08:00:40Z", "归还时刻扫错")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "out", rb.State)
+	assert.Equal(t, int64(0), rb.AccumulatedSeconds)
+	assert.Equal(t, "usable", rb.Status)
+
+	code, rb, _ = postEvent(t, srv, "R-1b", "return", "2026-09-13T08:00:50Z") // real +45
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, "in", rb.State)
+	assert.Equal(t, int64(45), rb.AccumulatedSeconds)
+	assert.Equal(t, "usable", rb.Status)
+}
+
+func TestRevokeTakeoutBackInside(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-2", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-2", "takeout", "2026-09-13T08:00:10Z")
+	b := getBatch(t, srv, "R-2")
+	require.Equal(t, "out", b.State)
+
+	code, rb, _ := revokeEvent(t, srv, "R-2", 1, "2026-09-13T08:00:20Z", "误扫取出")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "in", rb.State, "revoking a takeout moves the batch back inside")
+	assert.Equal(t, int64(0), rb.AccumulatedSeconds)
+	assert.Nil(t, rb.LastEvent, "no active event remains")
+	assert.Len(t, listEvents(t, srv, "R-2").Events, 1, "revoked row retained in ledger")
+
+	// Operations can continue correctly from the restored in-cabinet state.
+	code, rb, _ = postEvent(t, srv, "R-2", "takeout", "2026-09-13T08:00:30Z")
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, "out", rb.State)
+}
+
+func TestRevokeTakeoutRevertsToPreviousReturn(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-2b", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-2b", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "R-2b", "return", "2026-09-13T08:00:20Z") // +10
+	postEvent(t, srv, "R-2b", "takeout", "2026-09-13T08:00:30Z")
+
+	code, rb, _ := revokeEvent(t, srv, "R-2b", 3, "2026-09-13T08:00:40Z", "误扫取出")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "in", rb.State)
+	assert.Equal(t, int64(10), rb.AccumulatedSeconds)
+	require.NotNil(t, rb.LastEvent)
+	assert.Equal(t, "return", rb.LastEvent.Type, "lastEvent reverts to the previous return (id 2)")
+	assert.Equal(t, "2026-09-13T08:00:20Z", rb.LastEvent.At)
+}
+
+func TestRevokeNonLastEventRejected(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-3", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-3", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "R-3", "return", "2026-09-13T08:00:20Z")
+
+	// Event 1 (takeout) is not the last active event (2 is).
+	code, _, e := revokeEvent(t, srv, "R-3", 1, "2026-09-13T08:00:30Z", "尝试撤销旧记录")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "not_last_event", e.Error.Code)
+
+	b := getBatch(t, srv, "R-3")
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(10), b.AccumulatedSeconds, "failed revoke changes nothing")
+	evs := listEvents(t, srv, "R-3")
+	require.Len(t, evs.Events, 2)
+	assert.Nil(t, evs.Events[0].RevokedAt)
+	assert.Nil(t, evs.Events[1].RevokedAt)
+}
+
+func TestDuplicateRevocationRejected(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-4", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-4", "takeout", "2026-09-13T08:00:10Z")
+	code, _, _ := revokeEvent(t, srv, "R-4", 1, "2026-09-13T08:00:20Z", "第一次撤销")
+	require.Equal(t, http.StatusOK, code)
+
+	// Same event again: already revoked → 409.
+	code, _, e := revokeEvent(t, srv, "R-4", 1, "2026-09-13T08:00:30Z", "重复撤销")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "already_revoked", e.Error.Code)
+
+	// The row stays revoked: it is rejected as an already-revoked target.
+	code, _, e = revokeEvent(t, srv, "R-4", 1, "2026-09-13T08:00:40Z", "再试")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "already_revoked", e.Error.Code)
+
+	b := getBatch(t, srv, "R-4")
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+}
+
+func TestRevokeThenRevokePreviousEvent(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-4b", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-4b", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "R-4b", "return", "2026-09-13T08:00:20Z")
+	postEvent(t, srv, "R-4b", "takeout", "2026-09-13T08:00:30Z")
+
+	// Undo in order: newest first.
+	code, _, _ := revokeEvent(t, srv, "R-4b", 3, "2026-09-13T08:00:40Z", "撤销误取出")
+	require.Equal(t, http.StatusOK, code)
+	code, b, _ := revokeEvent(t, srv, "R-4b", 2, "2026-09-13T08:00:50Z", "撤销误归还")
+	require.Equal(t, http.StatusOK, code)
+	assert.Equal(t, "out", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+	require.NotNil(t, b.LastEvent)
+	assert.Equal(t, "takeout", b.LastEvent.Type)
+	assert.Equal(t, "2026-09-13T08:00:10Z", b.LastEvent.At)
+}
+
+func TestRevokeTimeValidation(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-5", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-5", "takeout", "2026-09-13T08:00:10Z")
+
+	// Revocation not strictly later than the last operation (the takeout).
+	code, _, e := revokeEvent(t, srv, "R-5", 1, "2026-09-13T08:00:10Z", "同时刻")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "time_not_monotonic", e.Error.Code)
+
+	code, _, e = revokeEvent(t, srv, "R-5", 1, "2026-09-13T08:00:05Z", "更早")
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "time_not_monotonic", e.Error.Code)
+
+	// Bad time format.
+	code, _, e = revokeEvent(t, srv, "R-5", 1, "2026-09-13T08:00:20", "缺Z")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "invalid_time", e.Error.Code)
+
+	// Empty/whitespace reason.
+	code, _, e = revokeEvent(t, srv, "R-5", 1, "2026-09-13T08:00:20Z", "   ")
+	assert.Equal(t, http.StatusBadRequest, code)
+	assert.Equal(t, "reason_required", e.Error.Code)
+
+	b := getBatch(t, srv, "R-5")
+	assert.Equal(t, "out", b.State)
+	assert.Nil(t, b.LastEvent.RevokedAt)
+}
+
+func TestRevokeUnknownBatchAndEvent(t *testing.T) {
+	srv := newServer(t)
+	code, _, e := revokeEvent(t, srv, "GHOST", 1, "2026-09-13T08:00:20Z", "x")
+	assert.Equal(t, http.StatusNotFound, code)
+	assert.Equal(t, "not_found", e.Error.Code)
+
+	createBatch(t, srv, "R-6", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-6", "takeout", "2026-09-13T08:00:10Z")
+
+	// Bad path id.
+	code, raw := doJSON(t, http.MethodPost, srv.URL+"/api/batches/R-6/events/abc/revocation",
+		map[string]string{"at": "2026-09-13T08:00:20Z", "reason": "x"})
+	assert.Equal(t, http.StatusBadRequest, code)
+	require.NoError(t, json.Unmarshal(raw, &e))
+	assert.Equal(t, "invalid_event_id", e.Error.Code)
+
+	// Non-existent event id.
+	code, _, e = revokeEvent(t, srv, "R-6", 999, "2026-09-13T08:00:20Z", "x")
+	assert.Equal(t, http.StatusNotFound, code)
+	assert.Equal(t, "not_found", e.Error.Code)
+}
+
+func TestRevokeIsTransactionalOnFailure(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-7", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-7", "takeout", "2026-09-13T08:00:10Z")
+	postEvent(t, srv, "R-7", "return", "2026-09-13T08:00:20Z")
+	pre := getBatch(t, srv, "R-7")
+
+	// A rejected revoke (non-last event) must leave the aggregate exactly as
+	// it was and add no audit annotation.
+	code, _, _ := revokeEvent(t, srv, "R-7", 1, "2026-09-13T08:00:30Z", "拒绝的撤销")
+	require.Equal(t, http.StatusConflict, code)
+	post := getBatch(t, srv, "R-7")
+	assert.Equal(t, pre.State, post.State)
+	assert.Equal(t, pre.AccumulatedSeconds, post.AccumulatedSeconds)
+	assert.Equal(t, pre.Status, post.Status)
+	for _, ev := range listEvents(t, srv, "R-7").Events {
+		assert.Nil(t, ev.RevokedAt)
+	}
+}
+
+func TestConcurrentRevokeOnlyOneWins(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-8", 100, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-8", "takeout", "2026-09-13T08:00:10Z")
+
+	const n = 16
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	errCodes := make([]string, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			codes[i], errCodes[i] = revokeRaw(srv, "R-8", 1, "2026-09-13T08:00:20Z", "并发撤销")
+		}(i)
+	}
+	wg.Wait()
+
+	wins := 0
+	for i, c := range codes {
+		if c == http.StatusOK {
+			wins++
+		} else {
+			assert.Equal(t, http.StatusConflict, c, "i=%d code=%s", i, errCodes[i])
+		}
+	}
+	assert.Equal(t, 1, wins, "two stations revoking concurrently: exactly one may commit")
+
+	b := getBatch(t, srv, "R-8")
+	assert.Equal(t, "in", b.State)
+	assert.Equal(t, int64(0), b.AccumulatedSeconds)
+	evs := listEvents(t, srv, "R-8")
+	require.Len(t, evs.Events, 1)
+	require.NotNil(t, evs.Events[0].RevokedAt, "audit field persisted exactly once")
+}
+
+// Existing critical timing flows must keep their exact results when the
+// revocation capability is never used (regression guard for the added audit
+// columns / adjusted queries).
+func TestNoRevocationCriticalFlowsUnchanged(t *testing.T) {
+	srv := newServer(t)
+	createBatch(t, srv, "R-9", 10, "2026-09-13T08:00:00Z")
+	postEvent(t, srv, "R-9", "takeout", "2026-09-13T08:00:05Z")
+	code, b, _ := postEvent(t, srv, "R-9", "return", "2026-09-13T08:00:15Z")
+	require.Equal(t, http.StatusCreated, code)
+	assert.Equal(t, int64(10), b.AccumulatedSeconds)
+	assert.Equal(t, "usable", b.Status)
+	require.NotNil(t, b.LastEvent)
+	assert.Nil(t, b.LastEvent.RevokedAt)
+	assert.Nil(t, b.LastEvent.RevokeReason)
+	for _, ev := range listEvents(t, srv, "R-9").Events {
+		assert.Nil(t, ev.RevokedAt)
+		assert.Nil(t, ev.RevokeReason)
+	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,6 +31,7 @@ func NewRouter(st *store.Store) *gin.Engine {
 	api.GET("/batches/:barcode", s.getBatch)
 	api.GET("/batches/:barcode/events", s.listEvents)
 	api.POST("/batches/:barcode/events", s.createEvent)
+	api.POST("/batches/:barcode/events/:id/revocation", s.revokeEvent)
 	return r
 }
 
@@ -181,7 +183,58 @@ func (s *Server) createEvent(c *gin.Context) {
 	s.respondBatch(c, http.StatusCreated, b)
 }
 
-// respondBatch renders the batch together with its latest event (if any).
+type revokeEventReq struct {
+	At     string `json:"at"`
+	Reason string `json:"reason"`
+}
+
+// revokeEvent handles POST /batches/:barcode/events/:id/revocation. Only the
+// last non-revoked event may be undone; the audit-carrying request requires a
+// canonical whole-second Z time and a non-empty reason.
+func (s *Server) revokeEvent(c *gin.Context) {
+	barcode := c.Param("barcode")
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(c, http.StatusBadRequest, "invalid_event_id", "event id must be a positive integer")
+		return
+	}
+	var req revokeEventReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeErr(c, http.StatusBadRequest, "bad_request", "invalid JSON body: "+err.Error())
+		return
+	}
+	at, err := parseEventTime(req.At)
+	if err != nil {
+		writeErr(c, http.StatusBadRequest, "invalid_time", err.Error())
+		return
+	}
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		writeErr(c, http.StatusBadRequest, "reason_required", "reason must be a non-empty string")
+		return
+	}
+	if len(reason) > 500 {
+		writeErr(c, http.StatusBadRequest, "reason_too_long", "reason must be at most 500 characters")
+		return
+	}
+	b, err := s.st.RevokeEvent(c.Request.Context(), barcode, id, at, reason)
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrEventNotFound) {
+		writeErr(c, http.StatusNotFound, "not_found", "no event with this id for this batch")
+		return
+	}
+	var ce *store.ConflictError
+	if errors.As(err, &ce) {
+		writeErr(c, http.StatusConflict, ce.Code, ce.Message)
+		return
+	}
+	if err != nil {
+		writeErr(c, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	s.respondBatch(c, http.StatusOK, b)
+}
+
+// respondBatch renders the batch together with its latest active event (if any).
 func (s *Server) respondBatch(c *gin.Context, status int, b *store.Batch) {
 	var last *eventJSON
 	if ev, err := s.st.LastEvent(c.Request.Context(), b.Barcode); err == nil && ev != nil {
@@ -206,15 +259,28 @@ type eventJSON struct {
 	Type         string `json:"type"`
 	At           string `json:"at"`
 	DeltaSeconds *int64 `json:"deltaSeconds"`
+	// RevokedAt/RevokeReason are present only for revoked events; older
+	// clients that ignore unknown fields keep working unchanged.
+	RevokedAt    *string `json:"revokedAt,omitempty"`
+	RevokeReason *string `json:"revokeReason,omitempty"`
 }
 
 func toEventJSON(ev *store.Event) eventJSON {
-	return eventJSON{
+	j := eventJSON{
 		ID:           ev.ID,
 		Type:         ev.Type,
 		At:           ev.At.UTC().Format(time.RFC3339),
 		DeltaSeconds: ev.DeltaSeconds,
 	}
+	if ev.RevokedAt != nil {
+		s := ev.RevokedAt.UTC().Format(time.RFC3339)
+		j.RevokedAt = &s
+	}
+	if ev.RevokeReason != nil {
+		r := *ev.RevokeReason
+		j.RevokeReason = &r
+	}
+	return j
 }
 
 type batchJSON struct {
