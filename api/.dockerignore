@@ -1,0 +1,6 @@
+.git
+data
+*.db
+*.db-journal
+Dockerfile
+.dockerignore

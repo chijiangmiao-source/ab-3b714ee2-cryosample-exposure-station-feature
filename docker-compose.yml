@@ -1,0 +1,44 @@
+name: timing-station
+
+# Freezer sample scan-timing station.
+#   docker compose up --build -d api web     # run the station
+#   docker compose up --build --exit-code-from verify verify   # one-shot acceptance
+# Host ports are overridden with WEB_PORT / API_PORT (defaults 8081 / 8080).
+
+services:
+  api:
+    build: ./api
+    environment:
+      PORT: 8080
+      DB_PATH: /data/app.db
+    volumes:
+      - api-data:/data
+    ports:
+      - "${API_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-8081}:80"
+    restart: unless-stopped
+
+  # One-shot acceptance suite: runs the boundary / over-limit / duplicate /
+  # race checks against the live stack, then exits (0 = all passed).
+  verify:
+    build: ./verify
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    environment:
+      API_BASE: http://api:8080/api
+      WEB_BASE: http://web:80
+    restart: "no"
+
+volumes:
+  api-data:
